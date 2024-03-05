@@ -6,29 +6,28 @@ See documentations at docs/bigdlllm_integration.md
 
 import argparse
 import asyncio
-import dataclasses
-import logging
 import json
 import os
-import time
 from typing import List, Optional
-import threading
-import uuid
 from bigdl.llm.utils.common import invalidInputError
 from bigdl.llm.utils import load_model
 
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import StreamingResponse, JSONResponse
 
+from fastchat.model.model_adapter import (
+    add_model_args,
+    get_generate_stream_function,
+)
 from fastchat.modules.gptq import GptqConfig
 from fastchat.modules.awq import AWQConfig
 from fastchat.serve.base_model_worker import BaseModelWorker
 from fastchat.constants import WORKER_HEART_BEAT_INTERVAL, ErrorCode, SERVER_ERROR_MSG
+from fastchat.utils import get_context_length
 from fastchat.serve.model_worker import (
     logger,
     worker_id,
 )
-import requests
 
 import torch
 import uvicorn
@@ -47,7 +46,8 @@ class BigDLLLMWorker(BaseModelWorker):
         device: str,
         num_gpus: int,
         max_gpu_memory: str,
-        load_8bit: bool = False,
+        low_bit: str,
+        low_cpu_mem_usage: bool = False,
         cpu_offloading: bool = False,
         gptq_config: Optional[GptqConfig] = None,
         awq_config: Optional[AWQConfig] = None,
@@ -67,18 +67,27 @@ class BigDLLLMWorker(BaseModelWorker):
         logger.info(
             f"Loading the model {self.model_names} on worker {worker_id}, worker type: BigDLLLM worker..."
         )
-        from fastchat.model.model_adapter import load_model
+        from bigdl.llm.utils import load_model
         self.model, self.tokenizer = load_model(
             model_path,
             device=device,
             num_gpus=num_gpus,
             max_gpu_memory=max_gpu_memory,
-            load_8bit=load_8bit,
+            low_bit=low_bit,
             cpu_offloading=cpu_offloading,
             gptq_config=gptq_config,
             awq_config=awq_config,
+            debug=True
         )
+        self.device = device
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.context_len = get_context_length(self.model.config)
+        self.generate_stream_func = get_generate_stream_function(self.model, model_path)
+        self.stream_interval = stream_interval
         
+        if not no_register:
+            self.init_heart_beat()
 
     def generate_stream_gate(self, params):
         self.call_ct += 1
@@ -302,22 +311,17 @@ if __name__ == "__main__":
     args = parser.parse_args()
     logger.info(f"args: {args}")
 
-    if args.gpus:
-        invalidInputError(len(args.gpus.split(",")) > args.num_gpus, f"Larger --num-gpus "
-                          "({args.num_gpus}) than --gpus {args.gpus}!")
-        os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
-
-    gptq_config = GptqConfig(
-        ckpt=args.gptq_ckpt or args.model_path,
-        wbits=args.gptq_wbits,
-        groupsize=args.gptq_groupsize,
-        act_order=args.gptq_act_order,
-    )
-    awq_config = AWQConfig(
-        ckpt=args.awq_ckpt or args.model_path,
-        wbits=args.awq_wbits,
-        groupsize=args.awq_groupsize,
-    )
+    # gptq_config = GptqConfig(
+    #     ckpt=args.gptq_ckpt or args.model_path,
+    #     wbits=args.gptq_wbits,
+    #     groupsize=args.gptq_groupsize,
+    #     act_order=args.gptq_act_order,
+    # )
+    # awq_config = AWQConfig(
+    #     ckpt=args.awq_ckpt or args.model_path,
+    #     wbits=args.awq_wbits,
+    #     groupsize=args.awq_groupsize,
+    # )
 
     worker = BigDLLLMWorker(
         args.controller_address,
